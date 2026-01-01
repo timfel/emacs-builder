@@ -1,0 +1,11 @@
+# Downloaded APKs and tools
+cache/
+output/
+tools/
+
+# Keep directory structure
+!cache/.gitkeep
+!output/.gitkeep
+
+# OS files
+.DS_Store
