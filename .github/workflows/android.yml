@@ -31,6 +31,7 @@ jobs:
     outputs:
       emacs_ref: ${{ steps.versions.outputs.emacs_ref }}
       emacs_version: ${{ steps.versions.outputs.emacs_version }}
+      android_api_level: ${{ steps.versions.outputs.android_api_level }}
       termux_version: ${{ steps.versions.outputs.termux_version }}
     steps:
       - uses: actions/checkout@v7
@@ -66,6 +67,7 @@ jobs:
     env:
       EMACS_REF: ${{ needs.resolve.outputs.emacs_ref }}
       EMACS_VERSION: ${{ needs.resolve.outputs.emacs_version }}
+      ANDROID_API_LEVEL: ${{ needs.resolve.outputs.android_api_level }}
       TERMUX_VERSION: ${{ needs.resolve.outputs.termux_version }}
       ANDROID_ARCH: ${{ matrix.android_arch }}
       ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -103,7 +105,7 @@ jobs:
         run: |
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager \
-            "platforms;android-37" \
+            "platforms;android-${{ needs.resolve.outputs.android_api_level }}" \
             "build-tools;35.0.0" \
             "ndk;27.2.12479018"
 
@@ -125,6 +127,7 @@ jobs:
     env:
       EMACS_REF: ${{ needs.resolve.outputs.emacs_ref }}
       EMACS_VERSION: ${{ needs.resolve.outputs.emacs_version }}
+      ANDROID_API_LEVEL: ${{ needs.resolve.outputs.android_api_level }}
       TERMUX_VERSION: ${{ needs.resolve.outputs.termux_version }}
 
     steps:
