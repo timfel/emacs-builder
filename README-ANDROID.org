@@ -355,6 +355,7 @@ jobs:
 
       - name: Tangle the Android build files
         run: |
+          mkdir -p .build-android
           emacs --batch --quick --eval '(require (quote org))' \
             --eval '(org-babel-tangle-file "README-ANDROID.org")'
 
@@ -394,6 +395,7 @@ jobs:
 
       - name: Tangle the Android build files
         run: |
+          mkdir -p .build-android
           emacs --batch --quick --eval '(require (quote org))' \
             --eval '(org-babel-tangle-file "README-ANDROID.org")'
 
