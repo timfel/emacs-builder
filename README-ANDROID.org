@@ -66,20 +66,12 @@ emacs --batch --quick \
 ls .build-android/output/
 #+end_src
 
-The default local keystore is created at
-~.build-android/android.keystore~.  A build can use another keystore with
-~KEYSTORE_PATH~, ~KEYSTORE_PASSWORD~, ~KEY_PASSWORD~, and ~KEY_ALIAS~.
-
-For a stable signing identity, configure these GitHub Actions secrets:
-
-- ~ANDROID_KEYSTORE_BASE64~: base64-encoded JKS or PKCS#12 keystore;
-- ~ANDROID_KEYSTORE_PASSWORD~;
-- ~ANDROID_KEY_PASSWORD~; and
-- ~ANDROID_KEY_ALIAS~.
-
-If no keystore secret is configured, the workflow creates an ephemeral key.
-That is sufficient for the pair produced by one run, but a later run will
-require uninstalling the previous APKs before installation.
+The build uses the public GNU Emacs signing keystore at
+~java/emacs.keystore~ from the selected Emacs source tree.  Its password and
+alias are part of the upstream Android build, and the same keystore is used to
+re-sign the Termux APK.  This is intentional: the upstream README says the
+key has no security value and allows independently built Emacs APKs to update
+one another.
 
 * Installation
 
@@ -100,10 +92,10 @@ available until Termux itself has initialized them.
 
 * Build implementation
 
-The complete implementation is kept in this document.  Tangling it creates
-one ignored local build script and the workflow committed below.  Keeping the
-script here makes the release procedure reviewable without maintaining a
-separate library of shell files.
+The build script is kept in this document.  Tangling it creates one ignored
+local build script; the GitHub Actions workflow is maintained separately in
+~.github/workflows/android.yml~.  Keeping the script here makes the release
+procedure reviewable without maintaining a separate library of shell files.
 
 #+begin_src bash :tangle .build-android/build-android.sh :tangle-mode (identity #o755)
 #!/usr/bin/env bash
@@ -129,10 +121,10 @@ ANDROID_NDK_VERSION=${ANDROID_NDK_VERSION:-27.2.12479018}
 BUILD_TOOLS_VERSION=${BUILD_TOOLS_VERSION:-35.0.0}
 JOBS=${JOBS:-$(nproc)}
 
-KEYSTORE_PATH=${KEYSTORE_PATH:-"$ROOT/.build-android/android.keystore"}
-KEYSTORE_PASSWORD=${KEYSTORE_PASSWORD:-android}
-KEY_PASSWORD=${KEY_PASSWORD:-android}
-KEY_ALIAS=${KEY_ALIAS:-androiddebugkey}
+KEYSTORE_PASSWORD=emacs1
+KEY_PASSWORD=emacs1
+KEY_ALIAS='Emacs keystore'
+KEYSTORE_PATH=
 
 log() { printf '[android] %s\n' "$*" >&2; }
 fatal() { printf '[android] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -314,23 +306,14 @@ manifest_shared_user_id() {
 }
 
 prepare_keystore() {
-    mkdir -p "$(dirname -- "$KEYSTORE_PATH")"
-    if [[ -n ${KEYSTORE_BASE64:-} ]]; then
-        log 'Restoring signing keystore from KEYSTORE_BASE64'
-        printf '%s' "$KEYSTORE_BASE64" | base64 --decode >"$KEYSTORE_PATH"
-        chmod 600 "$KEYSTORE_PATH"
-    fi
-    if [[ ! -s $KEYSTORE_PATH ]]; then
-        log 'Generating signing keystore'
-        keytool -genkeypair -v \
-            -keystore "$KEYSTORE_PATH" \
-            -storepass "$KEYSTORE_PASSWORD" \
-            -keypass "$KEY_PASSWORD" \
-            -alias "$KEY_ALIAS" \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname 'CN=Emacs Termux shared UID, O=Android, C=US' \
-            >/dev/null 2>&1
-    fi
+    KEYSTORE_PATH="$BUILD_DIR/emacs/java/emacs.keystore"
+    [[ -s $KEYSTORE_PATH ]] || \
+        fatal "The upstream Emacs signing keystore is missing: $KEYSTORE_PATH"
+    keytool -list -keystore "$KEYSTORE_PATH" \
+        -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" \
+        >/dev/null 2>&1 || \
+        fatal 'The upstream Emacs signing keystore could not be opened'
+    log 'Using the upstream GNU Emacs signing keystore'
 }
 
 certificate_fingerprint() {
@@ -363,13 +346,13 @@ build() {
     select_android_arch
     resolve_versions >/dev/null
     find_android_sdk
-    prepare_keystore
 
     rm -rf "$OUTPUT_DIR"
     mkdir -p "$OUTPUT_DIR"
 
     local emacs_source termux_source
     build_emacs_from_source
+    prepare_keystore
     emacs_source=$EMACS_BUILT_APK
     termux_source=$(fetch_termux_apk)
 
@@ -405,6 +388,7 @@ Architecture: $ANDROID_ARCH
 Android API headers: $ANDROID_API_LEVEL
 Android minimum API: $ANDROID_MIN_API_LEVEL
 sharedUserId: $emacs_uid
+Signing keystore: GNU Emacs java/emacs.keystore
 SHA-256 signing certificate: $emacs_fingerprint
 EOF
     log "Built $(basename -- "$emacs_output")"

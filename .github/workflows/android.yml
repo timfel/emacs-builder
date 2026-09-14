@@ -70,10 +70,6 @@ jobs:
       ANDROID_API_LEVEL: ${{ needs.resolve.outputs.android_api_level }}
       TERMUX_VERSION: ${{ needs.resolve.outputs.termux_version }}
       ANDROID_ARCH: ${{ matrix.android_arch }}
-      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-      KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
 
     steps:
       - uses: actions/checkout@v7
