@@ -1,0 +1,507 @@
+#+TITLE: Shared-UID Emacs and Termux APKs
+#+AUTHOR: Tim Felgentreff
+#+PROPERTY: header-args :eval never
+
+* Purpose
+
+This document describes the Android build published by this repository.  It
+fetches the latest Termux-integrated Emacs APK and the latest official Termux
+APK, aligns them, and signs both with the same certificate.  The APKs are
+usable together because the source APKs declare the same Android
+~sharedUserId~; the build checks that declaration before signing.
+
+Android's shared-user feature is deprecated, but it is the mechanism used by
+the Termux-integrated Emacs build to make Termux's files and packages
+available to Emacs.  Installing these APKs replaces the signatures from the
+upstream projects.  An existing upstream Emacs or Termux installation must
+therefore be uninstalled first, and updates must continue to use the same
+keystore.
+
+This is a complete rewrite of the scripts originally imported from
+[[https://github.com/mikeyobrien/emacsapk][mikeyobrien/emacsapk]].  The
+unconnected import branch and its initial commit remain in this repository so
+the provenance is visible in the Git history.
+
+* Sources and output
+
+- Emacs: [[https://sourceforge.net/projects/android-ports-for-gnu-emacs/files/termux/][Android Ports for GNU Emacs, termux files]].
+- Termux: [[https://github.com/termux/termux-app/releases][official Termux app releases]], using the ~github-debug~ arm64 APK.
+- Output: two signed APKs, SHA-256 sidecars, and a build-info file.
+
+The workflow resolves the newest Emacs version from the SourceForge RSS feed
+and the newest non-draft Termux release from the GitHub API every time it
+runs.  It runs weekly and can also be started manually.  The current workflow
+builds ~arm64-v8a~, the architecture used by ordinary Android phones.
+
+* Local use
+
+The generated script needs Java 17, ~curl~, ~unzip~, and Android build-tools
+35.0.0 (including ~apksigner~, ~aapt2~, and ~zipalign~).  The GitHub runner
+installs these tools automatically.
+
+#+begin_src sh :eval never
+sudo apt-get install openjdk-17-jdk curl unzip
+# Install Android SDK build-tools 35.0.0 using sdkmanager, then:
+emacs --batch --quick \
+  --eval '(require (quote org))' \
+  --eval '(org-babel-tangle-file "README-ANDROID.org")'
+.build-android/build-android.sh
+ls .build-android/output/
+#+end_src
+
+The default local keystore is created at
+~.build-android/android.keystore~.  A build can use another keystore with
+~KEYSTORE_PATH~, ~KEYSTORE_PASSWORD~, ~KEY_PASSWORD~, and ~KEY_ALIAS~.
+
+For a stable signing identity, configure these GitHub Actions secrets:
+
+- ~ANDROID_KEYSTORE_BASE64~: base64-encoded JKS or PKCS#12 keystore;
+- ~ANDROID_KEYSTORE_PASSWORD~;
+- ~ANDROID_KEY_PASSWORD~; and
+- ~ANDROID_KEY_ALIAS~.
+
+If no keystore secret is configured, the workflow creates an ephemeral key.
+That is sufficient for the pair produced by one run, but a later run will
+require uninstalling the previous APKs before installation.
+
+* Installation
+
+Install both APKs from the same workflow run.  If either upstream application
+is already installed, remove it first because its signing certificate differs:
+
+#+begin_src sh :eval never
+adb uninstall org.gnu.emacs || true
+adb uninstall com.termux || true
+adb install emacs-*-shared-signed.apk
+adb install termux-*-shared-signed.apk
+#+end_src
+
+After Termux has bootstrapped its package environment, Emacs can invoke
+programs such as ~git~, ~python~, and ~gcc~ from Termux.  The common Android
+UID provides the filesystem permissions; it does not make Termux packages
+available until Termux itself has initialized them.
+
+* Build implementation
+
+The complete implementation is kept in this document.  Tangling it creates
+one ignored local build script and the workflow committed below.  Keeping the
+script here makes the release procedure reviewable without maintaining a
+separate library of shell files.
+
+#+begin_src bash :tangle .build-android/build-android.sh :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+CACHE_DIR=${CACHE_DIR:-"$ROOT/.build-android/cache"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$ROOT/.build-android/output"}
+
+EMACS_VERSION=${EMACS_VERSION:-}
+TERMUX_VERSION=${TERMUX_VERSION:-}
+EMACS_API_LEVEL=${EMACS_API_LEVEL:-29}
+ANDROID_ARCH=${ANDROID_ARCH:-arm64-v8a}
+BUILD_TOOLS_VERSION=${BUILD_TOOLS_VERSION:-35.0.0}
+
+SOURCEFORGE_TERMUX_URL=${SOURCEFORGE_TERMUX_URL:-https://sourceforge.net/projects/android-ports-for-gnu-emacs/files/termux}
+SOURCEFORGE_RSS_URL=${SOURCEFORGE_RSS_URL:-https://sourceforge.net/projects/android-ports-for-gnu-emacs/rss?path=/termux}
+TERMUX_REPOSITORY=${TERMUX_REPOSITORY:-termux/termux-app}
+
+KEYSTORE_PATH=${KEYSTORE_PATH:-"$ROOT/.build-android/android.keystore"}
+KEYSTORE_PASSWORD=${KEYSTORE_PASSWORD:-android}
+KEY_PASSWORD=${KEY_PASSWORD:-android}
+KEY_ALIAS=${KEY_ALIAS:-androiddebugkey}
+
+log() { printf '[android] %s\n' "$*" >&2; }
+fatal() { printf '[android] ERROR: %s\n' "$*" >&2; exit 1; }
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || fatal "Required command not found: $1"
+}
+
+latest_emacs_version() {
+    local version
+    version=$(curl --fail --silent --show-error --location --retry 5 \
+        --connect-timeout 30 "$SOURCEFORGE_RSS_URL" |
+        grep -oE 'emacs-[0-9]+\.[0-9]+(\.[0-9]+){0,2}' |
+        sed 's/^emacs-//' | sort -Vu | tail -n1 || true)
+    [[ -n $version ]] || fatal "Could not find an Emacs version in SourceForge RSS"
+    printf '%s\n' "$version"
+}
+
+latest_termux_version() {
+    local version
+    version=$(curl --fail --silent --show-error --location --retry 5 \
+        --connect-timeout 30 \
+        "https://api.github.com/repos/$TERMUX_REPOSITORY/releases/latest" |
+        sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([^"]+)".*/\1/p' |
+        head -n1 || true)
+    [[ -n $version ]] || fatal "Could not find the latest Termux release"
+    printf '%s\n' "$version"
+}
+
+resolve_versions() {
+    [[ -n $EMACS_VERSION ]] || EMACS_VERSION=$(latest_emacs_version)
+    [[ -n $TERMUX_VERSION ]] || TERMUX_VERSION=$(latest_termux_version)
+    printf 'emacs_version=%s\n' "$EMACS_VERSION"
+    printf 'termux_version=%s\n' "$TERMUX_VERSION"
+}
+
+find_android_tools() {
+    local sdk root
+    local -a roots=()
+    [[ -n ${ANDROID_SDK_ROOT:-} ]] && roots+=("$ANDROID_SDK_ROOT")
+    [[ -n ${ANDROID_HOME:-} ]] && roots+=("$ANDROID_HOME")
+    roots+=("$HOME/Android/Sdk" /opt/android-sdk)
+
+    for sdk in "${roots[@]}"; do
+        [[ -n $sdk ]] || continue
+        root="$sdk/build-tools/$BUILD_TOOLS_VERSION"
+        if [[ -x $root/apksigner && -x $root/aapt2 && -x $root/zipalign ]]; then
+            APKSIGNER=$root/apksigner
+            AAPT2=$root/aapt2
+            ZIPALIGN=$root/zipalign
+            return
+        fi
+    done
+
+    APKSIGNER=$(command -v apksigner || true)
+    AAPT2=$(command -v aapt2 || true)
+    ZIPALIGN=$(command -v zipalign || true)
+    [[ -x ${APKSIGNER:-} && -x ${AAPT2:-} && -x ${ZIPALIGN:-} ]] || \
+        fatal "Android build-tools $BUILD_TOOLS_VERSION were not found"
+}
+
+fetch_apk() {
+    local url=$1 destination=$2 temporary="${destination}.partial"
+    mkdir -p "$(dirname -- "$destination")"
+    if [[ -s $destination ]] && unzip -tqq "$destination" >/dev/null 2>&1; then
+        log "Using cached $(basename -- "$destination")"
+        return
+    fi
+    rm -f "$temporary"
+    log "Downloading $(basename -- "$destination")"
+    curl --fail --show-error --location --retry 5 --retry-delay 2 \
+        --connect-timeout 30 --output "$temporary" "$url"
+    unzip -tqq "$temporary" >/dev/null || fatal "Downloaded file is not an APK: $url"
+    mv -- "$temporary" "$destination"
+}
+
+manifest_shared_user_id() {
+    local apk=$1 value
+    value=$(
+        "$AAPT2" dump xmltree "$apk" AndroidManifest.xml |
+            sed -nE 's/.*android:sharedUserId\([^)]*\)="([^"]+)".*/\1/p' |
+            head -n1
+    )
+    [[ -n $value ]] || fatal "No android:sharedUserId found in $(basename -- "$apk")"
+    printf '%s\n' "$value"
+}
+
+prepare_keystore() {
+    mkdir -p "$(dirname -- "$KEYSTORE_PATH")"
+    if [[ -n ${KEYSTORE_BASE64:-} ]]; then
+        log "Restoring signing keystore from KEYSTORE_BASE64"
+        printf '%s' "$KEYSTORE_BASE64" | base64 --decode >"$KEYSTORE_PATH"
+        chmod 600 "$KEYSTORE_PATH"
+    fi
+    if [[ ! -s $KEYSTORE_PATH ]]; then
+        log "Generating signing keystore"
+        keytool -genkeypair -v \
+            -keystore "$KEYSTORE_PATH" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
+            -alias "$KEY_ALIAS" \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname 'CN=Emacs Termux shared UID, O=Android, C=US' \
+            >/dev/null 2>&1
+    fi
+}
+
+certificate_fingerprint() {
+    "$APKSIGNER" verify --print-certs "$1" 2>&1 |
+        sed -nE 's/.*SHA-256 certificate digest:[[:space:]]*//p' | head -n1
+}
+
+resign_apk() {
+    local source=$1 destination=$2 aligned="${destination}.aligned"
+    rm -f "$aligned" "$destination"
+    "$ZIPALIGN" -p -f 4 "$source" "$aligned"
+    mv -- "$aligned" "$destination"
+    KEYSTORE_PASSWORD="$KEYSTORE_PASSWORD" KEY_PASSWORD="$KEY_PASSWORD" \
+        "$APKSIGNER" sign \
+        --ks "$KEYSTORE_PATH" \
+        --ks-key-alias "$KEY_ALIAS" \
+        --ks-pass env:KEYSTORE_PASSWORD \
+        --key-pass env:KEY_PASSWORD \
+        "$destination"
+    "$APKSIGNER" verify --verbose "$destination" >/dev/null
+    "$ZIPALIGN" -c -P 16 -v 4 "$destination" >/dev/null
+}
+
+build() {
+    require_command curl
+    require_command unzip
+    require_command keytool
+    find_android_tools
+    resolve_versions >/dev/null
+    prepare_keystore
+
+    local emacs_source="$CACHE_DIR/emacs-${EMACS_VERSION}-${EMACS_API_LEVEL}-${ANDROID_ARCH}.apk"
+    local termux_source="$CACHE_DIR/termux-${TERMUX_VERSION}-${ANDROID_ARCH}.apk"
+    local emacs_url="$SOURCEFORGE_TERMUX_URL/emacs-${EMACS_VERSION}-${EMACS_API_LEVEL}-${ANDROID_ARCH}.apk/download"
+    local termux_url="https://github.com/$TERMUX_REPOSITORY/releases/download/v${TERMUX_VERSION}/termux-app_v${TERMUX_VERSION}%2Bgithub-debug_${ANDROID_ARCH}.apk"
+    local emacs_output="$OUTPUT_DIR/emacs-${EMACS_VERSION}-${ANDROID_ARCH}-shared-signed.apk"
+    local termux_output="$OUTPUT_DIR/termux-${TERMUX_VERSION}-${ANDROID_ARCH}-shared-signed.apk"
+
+    rm -rf "$OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR"
+    fetch_apk "$emacs_url" "$emacs_source"
+    fetch_apk "$termux_url" "$termux_source"
+
+    local emacs_uid termux_uid
+    emacs_uid=$(manifest_shared_user_id "$emacs_source")
+    termux_uid=$(manifest_shared_user_id "$termux_source")
+    log "Emacs sharedUserId: $emacs_uid"
+    log "Termux sharedUserId: $termux_uid"
+    [[ $emacs_uid == "$termux_uid" ]] || \
+        fatal "The APKs do not declare the same sharedUserId"
+
+    resign_apk "$emacs_source" "$emacs_output"
+    resign_apk "$termux_source" "$termux_output"
+
+    local emacs_fingerprint termux_fingerprint
+    emacs_fingerprint=$(certificate_fingerprint "$emacs_output")
+    termux_fingerprint=$(certificate_fingerprint "$termux_output")
+    [[ -n $emacs_fingerprint && $emacs_fingerprint == "$termux_fingerprint" ]] || \
+        fatal "The signed APK certificate fingerprints do not match"
+
+    sha256sum "$emacs_output" >"$emacs_output.sha256"
+    sha256sum "$termux_output" >"$termux_output.sha256"
+    cat >"$OUTPUT_DIR/BUILD-INFO.txt" <<EOF
+Emacs version: $EMACS_VERSION
+Termux version: $TERMUX_VERSION
+Architecture: $ANDROID_ARCH
+Android API filename level: $EMACS_API_LEVEL
+sharedUserId: $emacs_uid
+SHA-256 signing certificate: $emacs_fingerprint
+EOF
+    log "Built $(basename -- "$emacs_output")"
+    log "Built $(basename -- "$termux_output")"
+}
+
+case ${1:-build} in
+    resolve)
+        require_command curl
+        resolve_versions
+        ;;
+    build)
+        build
+        ;;
+    *)
+        fatal "Usage: $0 [resolve|build]"
+        ;;
+esac
+#+end_src
+
+* GitHub Actions workflow
+
+The workflow tangles this document before each job.  The resolve job supplies
+immutable version values to all build jobs, and the publish job puts the APKs
+and checksums on a GitHub release.  A repository keystore secret is optional,
+but is recommended when releases should be upgradeable without uninstalling.
+
+#+begin_src yaml :tangle .github/workflows/android.yml
+name: Android Emacs and Termux APKs
+
+on:
+  schedule:
+    - cron: '23 04 * * 1'
+  workflow_dispatch:
+    inputs:
+      emacs_version:
+        description: Emacs Android version (empty means latest)
+        required: false
+        default: ''
+        type: string
+      termux_version:
+        description: Termux version (empty means latest)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: android-apks
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      emacs_version: ${{ steps.versions.outputs.emacs_version }}
+      termux_version: ${{ steps.versions.outputs.termux_version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Org for tangling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends emacs-nox
+
+      - name: Tangle the Android build files
+        run: |
+          emacs --batch --quick --eval '(require (quote org))' \
+            --eval '(org-babel-tangle-file "README-ANDROID.org")'
+
+      - name: Resolve latest source releases
+        id: versions
+        env:
+          EMACS_VERSION: ${{ inputs.emacs_version }}
+          TERMUX_VERSION: ${{ inputs.termux_version }}
+        run: .build-android/build-android.sh resolve >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            android_arch: arm64-v8a
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      EMACS_VERSION: ${{ needs.resolve.outputs.emacs_version }}
+      TERMUX_VERSION: ${{ needs.resolve.outputs.termux_version }}
+      ANDROID_ARCH: ${{ matrix.android_arch }}
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Org for tangling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends emacs-nox
+
+      - name: Tangle the Android build files
+        run: |
+          emacs --batch --quick --eval '(require (quote org))' \
+            --eval '(org-babel-tangle-file "README-ANDROID.org")'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build-tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "build-tools;35.0.0"
+
+      - name: Build and verify shared-UID APKs
+        run: .build-android/build-android.sh build
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-apks-${{ matrix.android_arch }}
+          path: .build-android/output/*
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      EMACS_VERSION: ${{ needs.resolve.outputs.emacs_version }}
+      TERMUX_VERSION: ${{ needs.resolve.outputs.termux_version }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: android-apks-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          stamp=$(date --utc +%Y%m%d-%H%M%S)
+          tag="android-apks-${stamp}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          title="Android Emacs and Termux APKs ${stamp}"
+          gh release create "$tag" dist/*.apk dist/*.sha256 dist/BUILD-INFO.txt \
+            --target "$GITHUB_SHA" --title "$title" --latest \
+            --notes "Termux $TERMUX_VERSION and Termux-integrated Emacs $EMACS_VERSION, signed with one certificate and verified to declare the same Android sharedUserId."
+
+      - name: Prune old Android releases
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const prefix = "android-apks-";
+            const releases = (await github.paginate(
+              github.rest.repos.listReleases,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 },
+            ))
+              .filter(release =>
+                !release.draft && release.tag_name.startsWith(prefix))
+              .sort((a, b) =>
+                new Date(b.published_at || b.created_at) -
+                new Date(a.published_at || a.created_at));
+
+            const keep = new Set(releases.slice(0, 4).map(release => release.id));
+            for (const release of releases) {
+              if (keep.has(release.id)) continue;
+              core.info(`Deleting release ${release.tag_name}`);
+              await github.rest.repos.deleteRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: release.id,
+              });
+              try {
+                await github.rest.git.deleteRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `tags/${release.tag_name}`,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
+
+      - name: Remove superseded workflow artifacts
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 },
+            );
+            for (const artifact of artifacts) {
+              if (!artifact.name.startsWith("android-apks-")) continue;
+              if (String(artifact.workflow_run?.id) === String(context.runId)) continue;
+              core.info(`Deleting superseded artifact ${artifact.id}`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+              });
+            }
+#+end_src
