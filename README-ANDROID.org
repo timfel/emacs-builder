@@ -305,7 +305,7 @@ build_emacs_from_source() {
 manifest_shared_user_id() {
     local apk=$1 value
     value=$(
-        "$AAPT2" dump xmltree "$apk" AndroidManifest.xml |
+        "$AAPT2" dump xmltree --file AndroidManifest.xml "$apk" |
             sed -nE 's/.*android:sharedUserId\([^)]*\)="([^"]+)".*/\1/p' |
             head -n1
     )
