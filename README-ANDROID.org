@@ -5,17 +5,17 @@
 * Purpose
 
 This document describes the Android build published by this repository.  It
-fetches the latest Termux-integrated Emacs APK and the latest official Termux
-APK, aligns them, and signs both with the same certificate.  The APKs are
-usable together because the source APKs declare the same Android
-~sharedUserId~; the build checks that declaration before signing.
+builds GNU Emacs from an official Emacs source tag, configures it with
+~--with-shared-user-id=com.termux~, and pairs it with an official Termux APK.
+Both final APKs are signed with the same certificate so Emacs can access
+Termux's files and packages.
 
-Android's shared-user feature is deprecated, but it is the mechanism used by
-the Termux-integrated Emacs build to make Termux's files and packages
-available to Emacs.  Installing these APKs replaces the signatures from the
-upstream projects.  An existing upstream Emacs or Termux installation must
-therefore be uninstalled first, and updates must continue to use the same
-keystore.
+Android's shared-user feature is deprecated, but it is the mechanism supported
+by the upstream Emacs Android port for sharing an application's data.  The
+upstream Emacs documentation describes this exact Termux configuration in
+~java/INSTALL~.  Installing these APKs replaces the signatures from upstream
+projects.  An existing upstream Emacs or Termux installation must therefore
+be uninstalled first, and updates must continue to use the same keystore.
 
 This is a complete rewrite of the scripts originally imported from
 [[https://github.com/mikeyobrien/emacsapk][mikeyobrien/emacsapk]].  The
@@ -24,24 +24,40 @@ the provenance is visible in the Git history.
 
 * Sources and output
 
-- Emacs: [[https://sourceforge.net/projects/android-ports-for-gnu-emacs/files/termux/][Android Ports for GNU Emacs, termux files]].
+- Emacs source: the official GNU Emacs repository, mirrored at
+  [[https://github.com/emacs-mirror/emacs][emacs-mirror/emacs]].
+- Emacs Android build instructions: the upstream source file
+  [[https://git.savannah.gnu.org/cgit/emacs.git/tree/java/INSTALL][java/INSTALL]].
 - Termux: [[https://github.com/termux/termux-app/releases][official Termux app releases]], using the ~github-debug~ arm64 APK.
-- Output: two signed APKs, SHA-256 sidecars, and a build-info file.
+- Android dependencies: the pinned dependency sources selected by upstream's
+  ~admin/download-android-deps.sh~.  SourceForge is used there for source
+  tarballs, not for an Emacs APK.
+- Output: a source-built Emacs APK, an official Termux APK, SHA-256 sidecars,
+  and a build-info file.
 
-The workflow resolves the newest Emacs version from the SourceForge RSS feed
-and the newest non-draft Termux release from the GitHub API every time it
-runs.  It runs weekly and can also be started manually.  The current workflow
-builds ~arm64-v8a~, the architecture used by ordinary Android phones.
+The workflow resolves the newest numbered Emacs release tag from the official
+Emacs mirror and the newest non-draft Termux release from the GitHub API every
+time it runs.  It runs weekly and can also be started manually.  The current
+workflow builds ~arm64-v8a~, the architecture used by ordinary Android phones.
 
 * Local use
 
-The generated script needs Java 17, ~curl~, ~unzip~, and Android build-tools
-35.0.0 (including ~apksigner~, ~aapt2~, and ~zipalign~).  The GitHub runner
-installs these tools automatically.
+The source build needs Java 17, GNU build tools, ~curl~, ~git~, ~unzip~, and
+an Android SDK containing:
+
+- platform API 37;
+- build-tools 35.0.0; and
+- NDK 27.2.12479018 or newer.
+
+The GitHub runner installs these tools automatically.  To tangle and run the
+same build locally:
 
 #+begin_src sh :eval never
-sudo apt-get install openjdk-17-jdk curl unzip
-# Install Android SDK build-tools 35.0.0 using sdkmanager, then:
+sudo apt-get install autoconf automake build-essential curl file git \
+  gawk libdigest-sha-perl libtool m4 pkg-config texinfo unzip zip
+# Install Android platform 37, build-tools 35.0.0, and NDK 27.2.12479018
+# using sdkmanager, then:
+mkdir -p .build-android
 emacs --batch --quick \
   --eval '(require (quote org))' \
   --eval '(org-babel-tangle-file "README-ANDROID.org")'
@@ -91,21 +107,26 @@ separate library of shell files.
 #+begin_src bash :tangle .build-android/build-android.sh :tangle-mode (identity #o755)
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'status=$?; printf "[android] build failed at line %d (status %d): %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+BUILD_DIR=${BUILD_DIR:-"$ROOT/.build-android/work"}
 CACHE_DIR=${CACHE_DIR:-"$ROOT/.build-android/cache"}
 OUTPUT_DIR=${OUTPUT_DIR:-"$ROOT/.build-android/output"}
 
+EMACS_REPOSITORY=${EMACS_REPOSITORY:-https://github.com/emacs-mirror/emacs.git}
+EMACS_REF=${EMACS_REF:-}
 EMACS_VERSION=${EMACS_VERSION:-}
 TERMUX_VERSION=${TERMUX_VERSION:-}
-EMACS_API_LEVEL=${EMACS_API_LEVEL:-29}
-ANDROID_ARCH=${ANDROID_ARCH:-arm64-v8a}
-BUILD_TOOLS_VERSION=${BUILD_TOOLS_VERSION:-35.0.0}
-
-SOURCEFORGE_TERMUX_URL=${SOURCEFORGE_TERMUX_URL:-https://sourceforge.net/projects/android-ports-for-gnu-emacs/files/termux}
-SOURCEFORGE_RSS_URL=${SOURCEFORGE_RSS_URL:-https://sourceforge.net/projects/android-ports-for-gnu-emacs/rss?path=/termux}
 TERMUX_REPOSITORY=${TERMUX_REPOSITORY:-termux/termux-app}
+
+ANDROID_ARCH=${ANDROID_ARCH:-arm64-v8a}
+ANDROID_API_LEVEL=${ANDROID_API_LEVEL:-37}
+ANDROID_MIN_API_LEVEL=${ANDROID_MIN_API_LEVEL:-29}
+ANDROID_NDK_VERSION=${ANDROID_NDK_VERSION:-27.2.12479018}
+BUILD_TOOLS_VERSION=${BUILD_TOOLS_VERSION:-35.0.0}
+JOBS=${JOBS:-$(nproc)}
 
 KEYSTORE_PATH=${KEYSTORE_PATH:-"$ROOT/.build-android/android.keystore"}
 KEYSTORE_PASSWORD=${KEYSTORE_PASSWORD:-android}
@@ -119,14 +140,20 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || fatal "Required command not found: $1"
 }
 
-latest_emacs_version() {
-    local version
-    version=$(curl --fail --silent --show-error --location --retry 5 \
-        --connect-timeout 30 "$SOURCEFORGE_RSS_URL" |
-        grep -oE 'emacs-[0-9]+\.[0-9]+(\.[0-9]+){0,2}' |
-        sed 's/^emacs-//' | sort -Vu | tail -n1 || true)
-    [[ -n $version ]] || fatal "Could not find an Emacs version in SourceForge RSS"
+emacs_version_from_ref() {
+    local version=${1#emacs-}
+    [[ $version =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || \
+        fatal "Emacs ref is not a numbered release tag: $1"
     printf '%s\n' "$version"
+}
+
+latest_emacs_ref() {
+    local ref
+    ref=$(git ls-remote --tags --refs "$EMACS_REPOSITORY" |
+        sed -nE 's#^[0-9a-f]+[[:space:]]+refs/tags/(emacs-[0-9]+(\.[0-9]+){1,2})$#\1#p' |
+        sort -Vu | tail -n1 || true)
+    [[ -n $ref ]] || fatal "Could not find a numbered Emacs release tag"
+    printf '%s\n' "$ref"
 }
 
 latest_termux_version() {
@@ -141,50 +168,124 @@ latest_termux_version() {
 }
 
 resolve_versions() {
-    [[ -n $EMACS_VERSION ]] || EMACS_VERSION=$(latest_emacs_version)
+    [[ -n $EMACS_REF ]] || EMACS_REF=$(latest_emacs_ref)
+    EMACS_VERSION=${EMACS_VERSION:-$(emacs_version_from_ref "$EMACS_REF")}
     [[ -n $TERMUX_VERSION ]] || TERMUX_VERSION=$(latest_termux_version)
+    printf 'emacs_ref=%s\n' "$EMACS_REF"
     printf 'emacs_version=%s\n' "$EMACS_VERSION"
     printf 'termux_version=%s\n' "$TERMUX_VERSION"
 }
 
-find_android_tools() {
-    local sdk root
-    local -a roots=()
-    [[ -n ${ANDROID_SDK_ROOT:-} ]] && roots+=("$ANDROID_SDK_ROOT")
-    [[ -n ${ANDROID_HOME:-} ]] && roots+=("$ANDROID_HOME")
-    roots+=("$HOME/Android/Sdk" /opt/android-sdk)
-
-    for sdk in "${roots[@]}"; do
-        [[ -n $sdk ]] || continue
-        root="$sdk/build-tools/$BUILD_TOOLS_VERSION"
-        if [[ -x $root/apksigner && -x $root/aapt2 && -x $root/zipalign ]]; then
-            APKSIGNER=$root/apksigner
-            AAPT2=$root/aapt2
-            ZIPALIGN=$root/zipalign
-            return
-        fi
-    done
-
-    APKSIGNER=$(command -v apksigner || true)
-    AAPT2=$(command -v aapt2 || true)
-    ZIPALIGN=$(command -v zipalign || true)
-    [[ -x ${APKSIGNER:-} && -x ${AAPT2:-} && -x ${ZIPALIGN:-} ]] || \
-        fatal "Android build-tools $BUILD_TOOLS_VERSION were not found"
+select_android_arch() {
+    case "$ANDROID_ARCH" in
+        arm64-v8a)
+            NDK_TRIPLE=aarch64-linux-android
+            EMACS_ABI=aarch64
+            DEPS_BITS=64
+            ;;
+        x86_64)
+            NDK_TRIPLE=x86_64-linux-android
+            EMACS_ABI=x86_64
+            DEPS_BITS=64
+            ;;
+        armeabi-v7a)
+            NDK_TRIPLE=armv7a-linux-androideabi
+            EMACS_ABI=armv7
+            DEPS_BITS=32
+            ;;
+        *)
+            fatal "Unsupported Android architecture: $ANDROID_ARCH"
+            ;;
+    esac
 }
 
-fetch_apk() {
-    local url=$1 destination=$2 temporary="${destination}.partial"
-    mkdir -p "$(dirname -- "$destination")"
+find_android_sdk() {
+    SDK_ROOT=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}
+    [[ -n $SDK_ROOT && -d $SDK_ROOT ]] || \
+        fatal 'ANDROID_SDK_ROOT or ANDROID_HOME is not set'
+
+    SDK_BUILD_TOOLS="$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
+    ANDROID_JAR="$SDK_ROOT/platforms/android-$ANDROID_API_LEVEL/android.jar"
+    NDK_ROOT="$SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+    NDK_HOST_TAG=${NDK_HOST_TAG:-linux-x86_64}
+    NDK_TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/$NDK_HOST_TAG"
+    ANDROID_CC="$NDK_TOOLCHAIN/bin/${NDK_TRIPLE}${ANDROID_MIN_API_LEVEL}-clang"
+
+    [[ -f $ANDROID_JAR ]] || fatal "Android API $ANDROID_API_LEVEL is not installed"
+    [[ -x $SDK_BUILD_TOOLS/aapt ]] || fatal "aapt is missing from $SDK_BUILD_TOOLS"
+    [[ -x $SDK_BUILD_TOOLS/apksigner ]] || fatal "apksigner is missing from $SDK_BUILD_TOOLS"
+    [[ -x $SDK_BUILD_TOOLS/d8 ]] || fatal "d8 is missing from $SDK_BUILD_TOOLS"
+    [[ -x $SDK_BUILD_TOOLS/zipalign ]] || fatal "zipalign is missing from $SDK_BUILD_TOOLS"
+    [[ -x $NDK_TOOLCHAIN/bin/${NDK_TRIPLE}${ANDROID_MIN_API_LEVEL}-clang ]] || \
+        fatal "NDK compiler is missing: $ANDROID_CC"
+
+    APKSIGNER="$SDK_BUILD_TOOLS/apksigner"
+    AAPT2="$SDK_BUILD_TOOLS/aapt2"
+    ZIPALIGN="$SDK_BUILD_TOOLS/zipalign"
+}
+
+fetch_termux_apk() {
+    local destination="$CACHE_DIR/termux-${TERMUX_VERSION}-${ANDROID_ARCH}.apk"
+    local url="https://github.com/$TERMUX_REPOSITORY/releases/download/v${TERMUX_VERSION}/termux-app_v${TERMUX_VERSION}%2Bgithub-debug_${ANDROID_ARCH}.apk"
+    local temporary="${destination}.partial"
+
+    mkdir -p "$CACHE_DIR"
     if [[ -s $destination ]] && unzip -tqq "$destination" >/dev/null 2>&1; then
         log "Using cached $(basename -- "$destination")"
+        printf '%s\n' "$destination"
         return
     fi
+
     rm -f "$temporary"
-    log "Downloading $(basename -- "$destination")"
+    log "Downloading official Termux $(basename -- "$destination")"
     curl --fail --show-error --location --retry 5 --retry-delay 2 \
         --connect-timeout 30 --output "$temporary" "$url"
-    unzip -tqq "$temporary" >/dev/null || fatal "Downloaded file is not an APK: $url"
+    unzip -tqq "$temporary" >/dev/null || \
+        fatal "Downloaded Termux file is not an APK: $url"
     mv -- "$temporary" "$destination"
+    printf '%s\n' "$destination"
+}
+
+build_emacs_from_source() {
+    local source_dir="$BUILD_DIR/emacs"
+    local deps_dir="$BUILD_DIR/android-deps"
+    local ndk_path
+    local -a apks
+
+    rm -rf "$source_dir" "$deps_dir"
+    mkdir -p "$BUILD_DIR" "$deps_dir"
+
+    log "Cloning official GNU Emacs source at $EMACS_REF"
+    git clone --depth 1 --branch "$EMACS_REF" "$EMACS_REPOSITORY" "$source_dir"
+
+    log 'Generating the Emacs build system'
+    (cd "$source_dir" && ./autogen.sh)
+
+    log 'Downloading the pinned Android dependencies selected by upstream Emacs'
+    (cd "$deps_dir" && sh "$source_dir/admin/download-android-deps.sh" "$DEPS_BITS")
+    ndk_path=$(<"$deps_dir/search-path.txt")
+    [[ -n $ndk_path ]] || fatal 'The Emacs Android dependency search path is empty'
+
+    log 'Configuring GNU Emacs for Android and the Termux shared UID'
+    (
+        cd "$source_dir"
+        ANDROID_CC="$ANDROID_CC" \
+        SDK_BUILD_TOOLS="$SDK_BUILD_TOOLS" \
+        ./configure \
+            --with-android="$ANDROID_JAR" \
+            --with-shared-user-id=com.termux \
+            --with-ndk-path="$ndk_path" \
+            --without-android-debug
+    )
+
+    log "Building GNU Emacs for $ANDROID_ARCH"
+    (cd "$source_dir" && make -j"$JOBS" all)
+
+    shopt -s nullglob
+    apks=("$source_dir"/java/emacs-*.apk)
+    (( ${#apks[@]} == 1 )) || \
+        fatal "Expected one source-built Emacs APK, found ${#apks[@]}"
+    EMACS_BUILT_APK=${apks[0]}
 }
 
 manifest_shared_user_id() {
@@ -201,12 +302,12 @@ manifest_shared_user_id() {
 prepare_keystore() {
     mkdir -p "$(dirname -- "$KEYSTORE_PATH")"
     if [[ -n ${KEYSTORE_BASE64:-} ]]; then
-        log "Restoring signing keystore from KEYSTORE_BASE64"
+        log 'Restoring signing keystore from KEYSTORE_BASE64'
         printf '%s' "$KEYSTORE_BASE64" | base64 --decode >"$KEYSTORE_PATH"
         chmod 600 "$KEYSTORE_PATH"
     fi
     if [[ ! -s $KEYSTORE_PATH ]]; then
-        log "Generating signing keystore"
+        log 'Generating signing keystore'
         keytool -genkeypair -v \
             -keystore "$KEYSTORE_PATH" \
             -storepass "$KEYSTORE_PASSWORD" \
@@ -241,23 +342,21 @@ resign_apk() {
 
 build() {
     require_command curl
+    require_command git
     require_command unzip
     require_command keytool
-    find_android_tools
+    select_android_arch
+    find_android_sdk
     resolve_versions >/dev/null
     prepare_keystore
 
-    local emacs_source="$CACHE_DIR/emacs-${EMACS_VERSION}-${EMACS_API_LEVEL}-${ANDROID_ARCH}.apk"
-    local termux_source="$CACHE_DIR/termux-${TERMUX_VERSION}-${ANDROID_ARCH}.apk"
-    local emacs_url="$SOURCEFORGE_TERMUX_URL/emacs-${EMACS_VERSION}-${EMACS_API_LEVEL}-${ANDROID_ARCH}.apk/download"
-    local termux_url="https://github.com/$TERMUX_REPOSITORY/releases/download/v${TERMUX_VERSION}/termux-app_v${TERMUX_VERSION}%2Bgithub-debug_${ANDROID_ARCH}.apk"
-    local emacs_output="$OUTPUT_DIR/emacs-${EMACS_VERSION}-${ANDROID_ARCH}-shared-signed.apk"
-    local termux_output="$OUTPUT_DIR/termux-${TERMUX_VERSION}-${ANDROID_ARCH}-shared-signed.apk"
-
     rm -rf "$OUTPUT_DIR"
     mkdir -p "$OUTPUT_DIR"
-    fetch_apk "$emacs_url" "$emacs_source"
-    fetch_apk "$termux_url" "$termux_source"
+
+    local emacs_source termux_source
+    build_emacs_from_source
+    emacs_source=$EMACS_BUILT_APK
+    termux_source=$(fetch_termux_apk)
 
     local emacs_uid termux_uid
     emacs_uid=$(manifest_shared_user_id "$emacs_source")
@@ -265,8 +364,10 @@ build() {
     log "Emacs sharedUserId: $emacs_uid"
     log "Termux sharedUserId: $termux_uid"
     [[ $emacs_uid == "$termux_uid" ]] || \
-        fatal "The APKs do not declare the same sharedUserId"
+        fatal 'The APKs do not declare the same sharedUserId'
 
+    local emacs_output="$OUTPUT_DIR/emacs-${EMACS_VERSION}-${ANDROID_ARCH}-shared-signed.apk"
+    local termux_output="$OUTPUT_DIR/termux-${TERMUX_VERSION}-${ANDROID_ARCH}-shared-signed.apk"
     resign_apk "$emacs_source" "$emacs_output"
     resign_apk "$termux_source" "$termux_output"
 
@@ -274,15 +375,18 @@ build() {
     emacs_fingerprint=$(certificate_fingerprint "$emacs_output")
     termux_fingerprint=$(certificate_fingerprint "$termux_output")
     [[ -n $emacs_fingerprint && $emacs_fingerprint == "$termux_fingerprint" ]] || \
-        fatal "The signed APK certificate fingerprints do not match"
+        fatal 'The signed APK certificate fingerprints do not match'
 
     sha256sum "$emacs_output" >"$emacs_output.sha256"
     sha256sum "$termux_output" >"$termux_output.sha256"
     cat >"$OUTPUT_DIR/BUILD-INFO.txt" <<EOF
-Emacs version: $EMACS_VERSION
+Emacs source: $EMACS_REPOSITORY
+Emacs ref: $EMACS_REF
+Termux repository: $TERMUX_REPOSITORY
 Termux version: $TERMUX_VERSION
 Architecture: $ANDROID_ARCH
-Android API filename level: $EMACS_API_LEVEL
+Android API headers: $ANDROID_API_LEVEL
+Android minimum API: $ANDROID_MIN_API_LEVEL
 sharedUserId: $emacs_uid
 SHA-256 signing certificate: $emacs_fingerprint
 EOF
@@ -293,6 +397,7 @@ EOF
 case ${1:-build} in
     resolve)
         require_command curl
+        require_command git
         resolve_versions
         ;;
     build)
@@ -307,9 +412,10 @@ esac
 * GitHub Actions workflow
 
 The workflow tangles this document before each job.  The resolve job supplies
-immutable version values to all build jobs, and the publish job puts the APKs
-and checksums on a GitHub release.  A repository keystore secret is optional,
-but is recommended when releases should be upgradeable without uninstalling.
+immutable source and release values to the build job.  The build job installs
+the official Android toolchain, compiles Emacs, downloads the official Termux
+APK, verifies the shared UID, and re-signs both outputs with one key.  The
+publish job puts the APKs and checksums on a GitHub release.
 
 #+begin_src yaml :tangle .github/workflows/android.yml
 name: Android Emacs and Termux APKs
@@ -319,8 +425,8 @@ on:
     - cron: '23 04 * * 1'
   workflow_dispatch:
     inputs:
-      emacs_version:
-        description: Emacs Android version (empty means latest)
+      emacs_ref:
+        description: Official Emacs release tag, for example emacs-30.2 (empty means latest)
         required: false
         default: ''
         type: string
@@ -343,6 +449,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
+      emacs_ref: ${{ steps.versions.outputs.emacs_ref }}
       emacs_version: ${{ steps.versions.outputs.emacs_version }}
       termux_version: ${{ steps.versions.outputs.termux_version }}
     steps:
@@ -359,10 +466,10 @@ jobs:
           emacs --batch --quick --eval '(require (quote org))' \
             --eval '(org-babel-tangle-file "README-ANDROID.org")'
 
-      - name: Resolve latest source releases
+      - name: Resolve official source releases
         id: versions
         env:
-          EMACS_VERSION: ${{ inputs.emacs_version }}
+          EMACS_REF: ${{ inputs.emacs_ref }}
           TERMUX_VERSION: ${{ inputs.termux_version }}
         run: .build-android/build-android.sh resolve >> "$GITHUB_OUTPUT"
 
@@ -375,8 +482,9 @@ jobs:
           - runner: ubuntu-22.04
             android_arch: arm64-v8a
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 360
     env:
+      EMACS_REF: ${{ needs.resolve.outputs.emacs_ref }}
       EMACS_VERSION: ${{ needs.resolve.outputs.emacs_version }}
       TERMUX_VERSION: ${{ needs.resolve.outputs.termux_version }}
       ANDROID_ARCH: ${{ matrix.android_arch }}
@@ -388,10 +496,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Org for tangling
+      - name: Install Org and Emacs build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends emacs-nox
+          sudo apt-get install --yes --no-install-recommends \
+            autoconf automake build-essential ca-certificates curl emacs-nox \
+            file gawk git libdigest-sha-perl libtool m4 pkg-config texinfo \
+            unzip zip
 
       - name: Tangle the Android build files
         run: |
@@ -408,12 +519,15 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android build-tools
+      - name: Install Android platform, build-tools, and NDK
         run: |
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "build-tools;35.0.0"
+          sdkmanager \
+            "platforms;android-37" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018"
 
-      - name: Build and verify shared-UID APKs
+      - name: Build GNU Emacs from source and verify shared UID
         run: .build-android/build-android.sh build
 
       - name: Upload APKs
@@ -429,6 +543,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     env:
+      EMACS_REF: ${{ needs.resolve.outputs.emacs_ref }}
       EMACS_VERSION: ${{ needs.resolve.outputs.emacs_version }}
       TERMUX_VERSION: ${{ needs.resolve.outputs.termux_version }}
 
@@ -451,7 +566,7 @@ jobs:
           title="Android Emacs and Termux APKs ${stamp}"
           gh release create "$tag" dist/*.apk dist/*.sha256 dist/BUILD-INFO.txt \
             --target "$GITHUB_SHA" --title "$title" --latest \
-            --notes "Termux $TERMUX_VERSION and Termux-integrated Emacs $EMACS_VERSION, signed with one certificate and verified to declare the same Android sharedUserId."
+            --notes "GNU Emacs $EMACS_REF built from source and Termux $TERMUX_VERSION, signed with one certificate and verified to declare the same Android sharedUserId."
 
       - name: Prune old Android releases
         uses: actions/github-script@v9

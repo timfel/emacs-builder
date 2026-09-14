@@ -5,8 +5,8 @@ on:
     - cron: '23 04 * * 1'
   workflow_dispatch:
     inputs:
-      emacs_version:
-        description: Emacs Android version (empty means latest)
+      emacs_ref:
+        description: Official Emacs release tag, for example emacs-30.2 (empty means latest)
         required: false
         default: ''
         type: string
@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
+      emacs_ref: ${{ steps.versions.outputs.emacs_ref }}
       emacs_version: ${{ steps.versions.outputs.emacs_version }}
       termux_version: ${{ steps.versions.outputs.termux_version }}
     steps:
@@ -45,10 +46,10 @@ jobs:
           emacs --batch --quick --eval '(require (quote org))' \
             --eval '(org-babel-tangle-file "README-ANDROID.org")'
 
-      - name: Resolve latest source releases
+      - name: Resolve official source releases
         id: versions
         env:
-          EMACS_VERSION: ${{ inputs.emacs_version }}
+          EMACS_REF: ${{ inputs.emacs_ref }}
           TERMUX_VERSION: ${{ inputs.termux_version }}
         run: .build-android/build-android.sh resolve >> "$GITHUB_OUTPUT"
 
@@ -61,8 +62,9 @@ jobs:
           - runner: ubuntu-22.04
             android_arch: arm64-v8a
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 360
     env:
+      EMACS_REF: ${{ needs.resolve.outputs.emacs_ref }}
       EMACS_VERSION: ${{ needs.resolve.outputs.emacs_version }}
       TERMUX_VERSION: ${{ needs.resolve.outputs.termux_version }}
       ANDROID_ARCH: ${{ matrix.android_arch }}
@@ -74,10 +76,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Org for tangling
+      - name: Install Org and Emacs build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends emacs-nox
+          sudo apt-get install --yes --no-install-recommends \
+            autoconf automake build-essential ca-certificates curl emacs-nox \
+            file gawk git libdigest-sha-perl libtool m4 pkg-config texinfo \
+            unzip zip
 
       - name: Tangle the Android build files
         run: |
@@ -94,12 +99,15 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android build-tools
+      - name: Install Android platform, build-tools, and NDK
         run: |
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "build-tools;35.0.0"
+          sdkmanager \
+            "platforms;android-37" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018"
 
-      - name: Build and verify shared-UID APKs
+      - name: Build GNU Emacs from source and verify shared UID
         run: .build-android/build-android.sh build
 
       - name: Upload APKs
@@ -115,6 +123,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     env:
+      EMACS_REF: ${{ needs.resolve.outputs.emacs_ref }}
       EMACS_VERSION: ${{ needs.resolve.outputs.emacs_version }}
       TERMUX_VERSION: ${{ needs.resolve.outputs.termux_version }}
 
@@ -137,7 +146,7 @@ jobs:
           title="Android Emacs and Termux APKs ${stamp}"
           gh release create "$tag" dist/*.apk dist/*.sha256 dist/BUILD-INFO.txt \
             --target "$GITHUB_SHA" --title "$title" --latest \
-            --notes "Termux $TERMUX_VERSION and Termux-integrated Emacs $EMACS_VERSION, signed with one certificate and verified to declare the same Android sharedUserId."
+            --notes "GNU Emacs $EMACS_REF built from source and Termux $TERMUX_VERSION, signed with one certificate and verified to declare the same Android sharedUserId."
 
       - name: Prune old Android releases
         uses: actions/github-script@v9
