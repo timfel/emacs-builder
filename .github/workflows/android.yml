@@ -81,8 +81,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             autoconf automake build-essential ca-certificates curl emacs-nox \
-            file gawk git libdigest-sha-perl libtool m4 pkg-config texinfo \
-            unzip zip
+            file gawk git libdigest-sha-perl libtool libtool-bin m4 pkg-config \
+            python3 texinfo unzip zip
 
       - name: Tangle the Android build files
         run: |

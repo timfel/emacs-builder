@@ -150,9 +150,9 @@ emacs_version_from_ref() {
 latest_emacs_ref() {
     local ref
     ref=$(git ls-remote --tags --refs "$EMACS_REPOSITORY" |
-        sed -nE 's#^[0-9a-f]+[[:space:]]+refs/tags/(emacs-[0-9]+(\.[0-9]+){1,2})$#\1#p' |
+        sed -nE 's#^[0-9a-f]+[[:space:]]+refs/tags/(emacs-[0-9]+\.[1-9][0-9]*(\.[0-9]+)?)$#\1#p' |
         sort -Vu | tail -n1 || true)
-    [[ -n $ref ]] || fatal "Could not find a numbered Emacs release tag"
+    [[ -n $ref ]] || fatal "Could not find a stable Emacs release tag"
     printf '%s\n' "$ref"
 }
 
@@ -501,8 +501,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             autoconf automake build-essential ca-certificates curl emacs-nox \
-            file gawk git libdigest-sha-perl libtool m4 pkg-config texinfo \
-            unzip zip
+            file gawk git libdigest-sha-perl libtool libtool-bin m4 pkg-config \
+            python3 texinfo unzip zip
 
       - name: Tangle the Android build files
         run: |
