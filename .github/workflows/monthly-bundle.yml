@@ -1,26 +1,40 @@
-name: Monthly Emacs portable bundle
+name: Emacs release portable bundle
 
 on:
-  schedule:
-    - cron: '17 03 1 * *'
   workflow_dispatch:
-    inputs:
-      emacs_ref:
-        description: Emacs branch, tag, or commit to build
-        required: true
-        default: master
-        type: string
 
 permissions:
   contents: write
   actions: write
 
 concurrency:
-  group: monthly-emacs-bundle
+  group: emacs-release-bundle
   cancel-in-progress: false
 
 jobs:
+  resolve:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      emacs_ref: ${{ steps.latest_release.outputs.emacs_ref }}
+    steps:
+      - name: Resolve latest Emacs release tag
+        id: latest_release
+        run: |
+          latest_tag=$(git ls-remote --tags --refs \
+              https://github.com/emacs-mirror/emacs.git |
+            sed -nE 's#^[0-9a-f]+[[:space:]]+refs/tags/(emacs-[0-9]+\.[1-9][0-9]*\.[0-9]+)$#\1#p' |
+            sort -V |
+            tail -n1)
+          if [[ -z $latest_tag ]]; then
+            echo 'Could not find an Emacs release tag' >&2
+            exit 1
+          fi
+          echo "Using Emacs release tag $latest_tag"
+          echo "emacs_ref=$latest_tag" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +46,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     env:
-      EMACS_REF: ${{ inputs.emacs_ref || 'master' }}
+      EMACS_REF: ${{ needs.resolve.outputs.emacs_ref }}
 
     steps:
       - uses: actions/checkout@v7
@@ -73,11 +87,11 @@ jobs:
           retention-days: 90
 
   publish:
-    needs: build
+    needs: [build, resolve]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
-      EMACS_REF: ${{ inputs.emacs_ref || 'master' }}
+      EMACS_REF: ${{ needs.resolve.outputs.emacs_ref }}
 
     steps:
       - uses: actions/checkout@v7
