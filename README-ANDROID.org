@@ -339,7 +339,8 @@ certificate_fingerprint() {
 }
 
 resign_apk() {
-    local source=$1 destination=$2 aligned="${destination}.aligned"
+    local source=$1 destination=$2 aligned
+    aligned="${destination}.aligned"
     rm -f "$aligned" "$destination"
     "$ZIPALIGN" -p -f 4 "$source" "$aligned"
     mv -- "$aligned" "$destination"
