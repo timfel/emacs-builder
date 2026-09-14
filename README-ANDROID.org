@@ -335,7 +335,7 @@ prepare_keystore() {
 
 certificate_fingerprint() {
     "$APKSIGNER" verify --print-certs "$1" 2>&1 |
-        sed -nE 's/.*SHA-256 certificate digest:[[:space:]]*//p' | head -n1
+        awk '/certificate SHA-256 digest:/ { print $NF; exit }'
 }
 
 resign_apk() {
@@ -389,6 +389,8 @@ build() {
     local emacs_fingerprint termux_fingerprint
     emacs_fingerprint=$(certificate_fingerprint "$emacs_output")
     termux_fingerprint=$(certificate_fingerprint "$termux_output")
+    log "Emacs signing certificate: ${emacs_fingerprint:-unavailable}"
+    log "Termux signing certificate: ${termux_fingerprint:-unavailable}"
     [[ -n $emacs_fingerprint && $emacs_fingerprint == "$termux_fingerprint" ]] || \
         fatal 'The signed APK certificate fingerprints do not match'
 
