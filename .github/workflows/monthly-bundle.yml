@@ -17,13 +17,15 @@ jobs:
     timeout-minutes: 5
     outputs:
       emacs_ref: ${{ steps.latest_release.outputs.emacs_ref }}
+      emacs_version: ${{ steps.latest_release.outputs.emacs_version }}
     steps:
       - name: Resolve latest Emacs release tag
         id: latest_release
         run: |
           latest_tag=$(git ls-remote --tags --refs \
               https://github.com/emacs-mirror/emacs.git |
-            sed -nE 's#^[0-9a-f]+[[:space:]]+refs/tags/(emacs-[0-9]+\.[1-9][0-9]*\.[0-9]+)$#\1#p' |
+            sed -nE 's#^[0-9a-f]+[[:space:]]+refs/tags/(emacs-[0-9]+\.[1-9][0-9]*(\.[0-9]+)?)$#\1#p' |
+            awk -F. '{ if (NF < 3 || $3 + 0 < 50) print }' |
             sort -V |
             tail -n1)
           if [[ -z $latest_tag ]]; then
@@ -32,6 +34,7 @@ jobs:
           fi
           echo "Using Emacs release tag $latest_tag"
           echo "emacs_ref=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "emacs_version=${latest_tag#emacs-}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: resolve
@@ -92,6 +95,7 @@ jobs:
     timeout-minutes: 30
     env:
       EMACS_REF: ${{ needs.resolve.outputs.emacs_ref }}
+      EMACS_VERSION: ${{ needs.resolve.outputs.emacs_version }}
 
     steps:
       - uses: actions/checkout@v7
@@ -108,8 +112,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           stamp=$(date --utc +%Y%m%d-%H%M%S)
-          tag="emacs-bundle-${stamp}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          title="Emacs portable bundles ${stamp}"
+          # Version-like tag (starts with the Emacs version) so tools such as
+          # mise can parse it: e.g. 31.1-20260915-041200-1234-1
+          tag="${EMACS_VERSION}-${stamp}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          title="Emacs portable bundles ${stamp} (Emacs ${EMACS_VERSION})"
           gh release create "$tag" \
             dist/Emacs-*.tar.zst \
             dist/Emacs-*.tar.zst.sha256 \
@@ -121,7 +127,11 @@ jobs:
         uses: actions/github-script@v9
         with:
           script: |
-            const prefix = "emacs-bundle-";
+            // Bundle releases look like: 31.1-20260915-041200-1234-1
+            // (Android releases contain "-apk-" and are pruned elsewhere.)
+            const isBundle = tag =>
+              /^[0-9][0-9.]*(\.[0-9]+)?-2[0-9]{7}-[0-9]{6}-[0-9]+-[0-9]+$/.test(tag) &&
+              !tag.includes("-apk-");
             const releases = (await github.paginate(
               github.rest.repos.listReleases,
               {
@@ -131,7 +141,9 @@ jobs:
               },
             ))
               .filter(release =>
-                !release.draft && release.tag_name.startsWith(prefix))
+                !release.draft &&
+                (isBundle(release.tag_name) ||
+                  release.tag_name.startsWith("emacs-bundle-")))
               .sort((a, b) =>
                 new Date(b.published_at || b.created_at) -
                 new Date(a.published_at || a.created_at));

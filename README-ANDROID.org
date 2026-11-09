@@ -144,6 +144,7 @@ latest_emacs_ref() {
     local ref
     ref=$(git ls-remote --tags --refs "$EMACS_REPOSITORY" |
         sed -nE 's#^[0-9a-f]+[[:space:]]+refs/tags/(emacs-[0-9]+\.[1-9][0-9]*(\.[0-9]+)?)$#\1#p' |
+        awk -F. '{ if (NF < 3 || $3 + 0 < 50) print }' |
         sort -Vu | tail -n1 || true)
     [[ -n $ref ]] || fatal "Could not find a stable Emacs release tag"
     printf '%s\n' "$ref"

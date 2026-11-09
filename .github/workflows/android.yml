@@ -151,13 +151,15 @@ jobs:
         uses: actions/github-script@v9
         with:
           script: |
-            const prefix = "android-apks-";
+            // Android releases look like: 31.1-apk-20260915-041200-1234-1
             const releases = (await github.paginate(
               github.rest.repos.listReleases,
               { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 },
             ))
               .filter(release =>
-                !release.draft && release.tag_name.startsWith(prefix))
+                !release.draft &&
+                (release.tag_name.includes("-apk-") ||
+                  release.tag_name.startsWith("android-apks-")))
               .sort((a, b) =>
                 new Date(b.published_at || b.created_at) -
                 new Date(a.published_at || a.created_at));
