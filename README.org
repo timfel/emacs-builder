@@ -36,7 +36,8 @@ that works well on different systems. Some reasons for this design:
    locales, and timezone information.
 
 So, this now builds a Lucid Emacs (so I run through XWayland) without WebKit,
-Xwidgets, Gsettings, SELinux, or DBus integration.
+Xwidgets, Gsettings, or SELinux.  D-Bus support is included: Emacs links
+plain libdbus (no GLib), and the library comes from the builder.
 
 * The builder
 
@@ -52,7 +53,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       autoconf automake binutils build-essential ca-certificates file git \
-      libacl1-dev libasound2-dev libcairo2-dev libgif-dev libgnutls28-dev \
+      libacl1-dev libasound2-dev libcairo2-dev libdbus-1-dev libgif-dev \
+      libgnutls28-dev \
       libgpm-dev libharfbuzz-dev libjpeg-dev libmagickwand-dev \
       libncurses-dev libotf-dev libpng-dev libsqlite3-dev libtiff-dev \
       libtree-sitter-dev libwebp-dev libx11-dev libxaw7-dev libxext-dev \
@@ -158,7 +160,7 @@ CC="$BUILD_GCC" CXX="$BUILD_GXX" ./configure \
   --with-xpm \
   --with-sound=alsa \
   --without-pgtk \
-  --without-dbus \
+  --with-dbus \
   --without-gsettings \
   --without-gconf \
   --without-xwidgets \
@@ -200,9 +202,12 @@ OUTPUT_NAME="${PACKAGE_NAME}.tar.zst"
 
 * Bundling private libraries
 
-The archive follows an auditwheel-style policy: glibc and some closely related
-libraries come from the host; every other shared-library dependency comes from
-the builder.
+The archive follows an auditwheel-style policy: glibc, some closely related
+libraries, and ~libsystemd0~ come from the host; every other shared-library
+dependency comes from the builder.  The ~libsystemd.so.0~ exception exists
+because the distribution's libdbus client library links against it and these
+archives target systemd distributions; bundling our own libsystemd would only
+pair a private libsystemd with the host's libgcrypt, liblz4, and friends.
 
 ImageMagick needs a bit of special treatment: it loads modules and
 configuration dynamically, so we need to copy coders, filters, and data
@@ -242,8 +247,9 @@ cp -a "$magick_etc_source" "$PREFIX_DIR/usr/etc/"
 cp -a "$magick_share_source" "$PREFIX_DIR/usr/share/"
 #+end_src
 
-Some ImageMagick things pulls Gtk or DBus stuff again, I just remove those
-again.
+Some ImageMagick things pulls Gtk, GIO, or WebKit stuff again, I just remove
+those again.  (D-Bus is no longer on this list: Emacs now bundles libdbus on
+purpose.)
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 for module in "$PREFIX_DIR/usr/lib/ImageMagick"/{coders,filters}/*.so; do
@@ -251,7 +257,7 @@ for module in "$PREFIX_DIR/usr/lib/ImageMagick"/{coders,filters}/*.so; do
     removed=false
     while IFS= read -r dependency; do
         case "${dependency##*/}" in
-            libdbus-1.so.*|libgio-2.0.so.*|libgtk-*.so.*|librsvg-*.so.*|\
+            libgio-2.0.so.*|libgtk-*.so.*|librsvg-*.so.*|\
             libwebkit2gtk-*.so.*)
                 removed=true
                 break ;;
@@ -273,12 +279,16 @@ elf_soname() {
     readelf -d "$1" | awk -F'[][]' '/SONAME/ { print $2; exit }'
 }
 
-is_host_glibc() {
+# libsystemd.so.* stays on the host on purpose: it is only pulled in by the
+# builder's libdbus, and we want that paired with the host's own libgcrypt,
+# liblz4, and friends.
+is_host_library() {
     local name=${1##*/}
     case "$name" in
         ld-linux*.so.*|ld64.so.*|libc.so.*|libm.so.*|libmvec.so.*|\
         libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|libutil.so.*|\
-        libanl.so.*|libBrokenLocale.so.*|libnss_*.so.*|libthread_db.so.*)
+        libanl.so.*|libBrokenLocale.so.*|libnss_*.so.*|libthread_db.so.*|\
+        libsystemd.so.*)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -286,7 +296,7 @@ is_host_glibc() {
 
 copy_private_library() {
     local path=$1 name=${1##*/} real real_name soname link destination
-    is_host_glibc "$name" && return
+    is_host_library "$name" && return
     real=$(readlink -f "$path")
     [[ -f $real ]] || { printf 'Cannot copy dependency %s\n' "$path" >&2; exit 1; }
     real_name=${real##*/}
@@ -358,7 +368,7 @@ install -m755 "$($BUILD_GCC -print-prog-name=collect2)" "$tool_gcc/collect2"
 declare -A tool_library_seen=()
 copy_tool_library() {
     local path=$1 name=${1##*/} real real_name
-    is_host_glibc "$name" && return
+    is_host_library "$name" && return
     real=$(readlink -f "$path")
     [[ -f $real ]] || return
     real_name=${real##*/}
@@ -452,19 +462,20 @@ done < <(find "$toolchain" -type f -print0)
 
 Before packaging, I verify the policy in both directions: glibc implementation
 libraries must not be present, and every other ~DT_NEEDED~ name must resolve in
-the corresponding private directory.  Libraries from the removed GTK/GIO,
-D-Bus, WebKit, and librsvg stacks are rejected explicitly.
+the corresponding private directory, except for the host-provided libraries
+above.  Libraries from the removed GTK/GIO, WebKit, and librsvg stacks are
+rejected explicitly.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 for library in "$private_lib"/* "$tool_lib"/*; do
     [[ -e $library || -L $library ]] || continue
-    if is_host_glibc "${library##*/}"; then
-        printf 'Host glibc library was bundled unexpectedly: %s\n' "${library##*/}" >&2
+    if is_host_library "${library##*/}"; then
+        printf 'Host library was bundled unexpectedly: %s\n' "${library##*/}" >&2
         exit 1
     fi
 done
 
-for forbidden in libdbus-1.so.* libgio-2.0.so.* libgtk-*.so.* \
+for forbidden in libgio-2.0.so.* libgtk-*.so.* \
                  librsvg-*.so.* libwebkit2gtk-*.so.*; do
     if compgen -G "$private_lib/$forbidden" >/dev/null; then
         printf 'Removed platform library was bundled unexpectedly: %s\n' "$forbidden" >&2
@@ -477,7 +488,7 @@ while IFS= read -r -d '' elf; do
     dependency_dir=$private_lib
     [[ $elf == "$toolchain/"* ]] && dependency_dir=$tool_lib
     while IFS= read -r needed; do
-        is_host_glibc "$needed" && continue
+        is_host_library "$needed" && continue
         if [[ ! -e $dependency_dir/$needed ]]; then
             printf 'Bundled dependency %s required by %s is missing\n' \
                 "$needed" "$elf" >&2
