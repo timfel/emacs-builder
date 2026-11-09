@@ -39,12 +39,13 @@ export PATH="$prefix/bin:$work/host-bin:/usr/local/bin:/usr/bin:/bin"
 private_lib="$prefix/lib/private"
 toolchain="$prefix/libexec/native-comp"
 tool_lib="$toolchain/lib"
-is_host_glibc() {
+is_host_library() {
     local name=${1##*/}
     case "$name" in
         ld-linux*.so.*|ld64.so.*|libc.so.*|libm.so.*|libmvec.so.*|\
         libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|libutil.so.*|\
-        libanl.so.*|libBrokenLocale.so.*|libnss_*.so.*|libthread_db.so.*)
+        libanl.so.*|libBrokenLocale.so.*|libnss_*.so.*|libthread_db.so.*|\
+        libsystemd.so.*)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -52,12 +53,12 @@ is_host_glibc() {
 
 for library in "$private_lib"/* "$tool_lib"/*; do
     [[ -e $library || -L $library ]] || continue
-    if is_host_glibc "${library##*/}"; then
-        printf 'Host glibc library is present: %s\n' "${library##*/}" >&2
+    if is_host_library "${library##*/}"; then
+        printf 'Host library is present: %s\n' "${library##*/}" >&2
         exit 1
     fi
 done
-for forbidden in libdbus-1.so.* libgio-2.0.so.* libgtk-*.so.* \
+for forbidden in libgio-2.0.so.* libgtk-*.so.* \
                  librsvg-*.so.* libwebkit2gtk-*.so.*; do
     if compgen -G "$private_lib/$forbidden" >/dev/null; then
         printf 'Removed platform library is present: %s\n' "$forbidden" >&2
@@ -83,7 +84,7 @@ while IFS= read -r -d '' elf; do
     dependency_dir=$private_lib
     [[ $elf == "$toolchain/"* ]] && dependency_dir=$tool_lib
     while IFS= read -r needed; do
-        is_host_glibc "$needed" && continue
+        is_host_library "$needed" && continue
         if [[ ! -e $dependency_dir/$needed ]]; then
             printf 'Bundled dependency %s required by %s is missing\n' \
                 "$needed" "$elf" >&2
@@ -111,8 +112,8 @@ cat >"$work/verify.el" <<EOF
 ;;; -*- lexical-binding: t; -*-
 (let ((required '("--with-x-toolkit=lucid" "--with-native-compilation"
                   "--with-tree-sitter" "--with-imagemagick"
-                  "--with-modules" "--with-xpm"))
-      (forbidden '("--with-pgtk" "--with-dbus" "--with-xwidgets"
+                  "--with-modules" "--with-xpm" "--with-dbus"))
+      (forbidden '("--with-pgtk" "--with-xwidgets"
                    "--with-rsvg" "--with-libsystemd" "--with-selinux")))
   (dolist (option required)
     (unless (string-match-p (regexp-quote option) system-configuration-options)
